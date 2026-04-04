@@ -1,0 +1,28 @@
+# Data (downloadable, large)
+data/
+
+# Generated outputs
+results/
+results_gravbalancer/
+benchmark_output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
