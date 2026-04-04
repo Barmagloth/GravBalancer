@@ -1,5 +1,5 @@
 """
-GravBalancer v10.6.6 — Multi-Scenario Synthetic Plant Harness
+GravBalancer — Multi-Scenario Synthetic Plant Harness
 
 Purpose: verify controller behavior across diverse regimes.
 NOT for tuning parameters — for checking "does it break?"
