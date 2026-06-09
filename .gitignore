@@ -5,6 +5,12 @@ data/
 results/
 results_gravbalancer/
 benchmark_output/
+harness_report.html
+harness_report_*.html
+
+# Local architecture mapping artifacts (not for publishing)
+docs/architecture_graph_*
+docs/architecture_map_*
 
 # Python
 __pycache__/

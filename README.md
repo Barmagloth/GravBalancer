@@ -16,6 +16,19 @@ In training setups where multiple neural networks compete or cooperate — most 
 
 **Core behavior:** If player A's proxy is high relative to player B's, GravBalancer increases A's learning rate and decreases B's, helping A "catch up." The total learning rate budget stays anchored to the user-supplied `base_lr`.
 
+## Input Contract (v10.9)
+
+- **Proxies must be non-negative.** Internal scales assume a positive signal;
+  for sign-changing losses (hinge, WGAN critic) wrap them monotonically —
+  e.g. `softplus(loss)` — instead of passing raw or ReLU-clipped values.
+  v10.8 silently clipped negatives to zero, destroying the signal; v10.9
+  raises `ValueError` on gross negatives and clamps FP-noise negatives
+  (within `1e-6 × scale`) with a one-time warning.
+- **Warmup must be long enough for convergence calibration.** By default
+  `convergence_window` auto-scales from `warmup_steps`; an explicitly
+  infeasible configuration raises at construction, and a degraded warmup
+  exit emits a `UserWarning` (it pins the steering deadband at max).
+
 ## What It Does NOT Do (By Design)
 
 - **Does not interpret proxy semantics.** It doesn't know what "loss" means or which direction is "good." It manages dynamics only: relative imbalance → corrective LR adjustment.

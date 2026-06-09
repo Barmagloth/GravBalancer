@@ -1,5 +1,5 @@
 """
-GravBalancer — Multi-Scenario Synthetic Plant Harness
+GravBalancer — Multi-Scenario Synthetic Plant Harness (v10.9)
 
 Purpose: verify controller behavior across diverse regimes.
 NOT for tuning parameters — for checking "does it break?"
@@ -13,10 +13,34 @@ Scenarios:
 
 Each scenario is a synthetic "plant" that produces stress proxies
 as a function of LRs and internal state. No real neural nets.
+
+v10.9 changes:
+  - Removed stale metric key 'stability_factor' (gone since v10.7.0) which
+    made the no_nan_inf hard invariant fail on EVERY scenario, masking the
+    real NaN check. NaN check is now per-key (reports offending keys).
+  - Removed k_stab=0.0 from the GravBalancer call (dead param since v10.7.0;
+    its original intent "throttle off" had silently inverted into "authority
+    on at default strength"). Throttle intent is now explicit: run_all() is
+    executed for BOTH debug_freeze="none" (authority active, true defaults)
+    and debug_freeze="no_throttle" (pure steering) — both are informative.
+  - Collects v10.9 observability keys: authority_factor, panic_factor,
+    climate_lr_meta, ramp_degraded, warmup_converged, dyn_deadband_z_eff.
+  - Single self-contained HTML report (harness_report.html) with inline
+    panels for every scenario × mode. Overwritten on each run by design:
+    the report is a pure function of the code; history lives in git.
+    Pass keep=True (CLI: --keep) to also save a timestamped copy.
 """
 
-import numpy as np
+import base64
+import io
+import os
+import sys
+import time
+import warnings
 from collections import defaultdict
+
+import numpy as np
+
 from grav_balancer import GravBalancer
 
 
@@ -147,6 +171,20 @@ class MultiPlayerPlant(SyntheticPlant):
 # Harness runner
 # ================================================================
 
+# Scalar/per-player metrics collected from last_metrics each post-warmup step.
+COLLECTED_KEYS = [
+    'u_sat_steer', 'lr_wall_final', 'wall_lr_any', 'wall_any',
+    'comfort_active', 'comfort_clipped', 'comfort_limited_by_headroom',
+    'calm', 'calm_cause', 'i_enabled', 'gate_disable_reason',
+    'toggle_count', 'z_max', 'ratio_max_over_mean',
+    'ratio_mean_over_min', 'headroom_min', 'noise_norm',
+    'authority_factor', 'panic_factor', 'climate_lr_meta',
+    'ramp_degraded', 'warmup_converged', 'dyn_deadband_z_eff',
+    'shock_path', 'quiet_factor',
+    'dyn_deadband_z_base', 'dyn_deadband_z', 'trip_active',
+]
+
+
 def run_scenario(plant, gb, n_steps=1000):
     """Run one scenario, collect step-level diagnostics."""
     history = defaultdict(list)
@@ -164,13 +202,7 @@ def run_scenario(plant, gb, n_steps=1000):
         # Collect key signals
         history['lrs'].append(lrs.copy())
         history['proxies'].append(proxies.copy())
-        for key in ['u_sat_steer', 'lr_wall_final', 'wall_lr_any', 'wall_any',
-                     'comfort_active', 'comfort_clipped', 'comfort_limited_by_headroom',
-                     'calm', 'calm_cause', 'i_enabled', 'gate_disable_reason',
-                     'toggle_count', 'z_max', 'ratio_max_over_mean',
-                     'ratio_mean_over_min', 'headroom_min', 'noise_norm',
-                     'stability_factor', 'shock_path', 'quiet_factor',
-                     'dyn_deadband_z_base', 'dyn_deadband_z']:
+        for key in COLLECTED_KEYS:
             val = m.get(key, float('nan'))
             if hasattr(val, '__len__'):
                 val = float(np.mean(val))
@@ -220,14 +252,23 @@ def compute_kpis(history, scenario_name=""):
     kpis['comfort_clipped_rate'] = float(np.mean(comfort_clipped)) if len(comfort_clipped) > 0 else 0.0
     kpis['comfort_clipped_ok'] = kpis['comfort_clipped_rate'] < 0.01
 
-    # NaN/inf check
-    has_nan = False
+    # NaN/inf check — per key, so a stale metric name is reported BY NAME
+    # instead of silently failing the whole invariant (the v10.8 harness
+    # failed this check on every scenario because of the removed
+    # 'stability_factor' key, and nobody could see why).
+    nan_keys = []
     for k, v in history.items():
         if isinstance(v, np.ndarray) and np.issubdtype(v.dtype, np.floating):
             if not np.isfinite(v).all():
-                has_nan = True
-                break
-    kpis['no_nan_inf'] = not has_nan
+                nan_keys.append(k)
+    kpis['nan_keys'] = nan_keys
+    kpis['no_nan_inf'] = (len(nan_keys) == 0)
+
+    # --- Warmup outcome ---
+    rd = history.get('ramp_degraded', np.array([]))
+    kpis['ramp_degraded'] = bool(rd[-1] > 0.5) if len(rd) > 0 else False
+    wc = history.get('warmup_converged', np.array([]))
+    kpis['warmup_converged'] = bool(wc[-1] > 0.5) if len(wc) > 0 else False
 
     # --- Management KPIs ---
     kpis['mean_u_sat_steer'] = float(np.mean(history['u_sat_steer']))
@@ -311,8 +352,10 @@ def compute_kpis(history, scenario_name=""):
         kpis['gov_output_jump_mean'] = 0.0
         kpis['gov_clip_ratio'] = 0.0
 
-    # Stability: not constant 1.0 (meaning stability throttle is active)?
-    kpis['mean_stability'] = float(np.mean(history['stability_factor']))
+    # Authority / safety layer levels
+    kpis['mean_authority'] = float(np.mean(history['authority_factor']))
+    kpis['mean_panic_factor'] = float(np.mean(history['panic_factor']))
+    kpis['min_climate_lr_meta'] = float(np.min(history['climate_lr_meta']))
 
     # Quiet-gate
     qf = history.get('quiet_factor', np.array([]))
@@ -363,15 +406,28 @@ SCENARIOS = {
     },
 }
 
+# Both throttle intents are informative and are run by default:
+#   "default"     — debug_freeze="none": authority/panic/comfort active,
+#                   true library defaults (what a user gets out of the box).
+#   "no_throttle" — debug_freeze="no_throttle": pure steering, safety
+#                   multipliers frozen at 1.0 (what the original v10.6-era
+#                   harness intended with its k_stab=0.0, before the dead
+#                   param silently inverted that intent).
+MODES = {
+    'default': 'none',
+    'no_throttle': 'no_throttle',
+}
 
-def run_all(base_lr=1e-3, warmup_steps=100, seed=42, verbose=True):
+
+def run_all(base_lr=1e-3, warmup_steps=100, seed=42, verbose=True,
+            debug_freeze='none'):
     """Run all scenarios with default GravBalancer params. Returns results dict."""
     results = {}
 
     for name, cfg in SCENARIOS.items():
         if verbose:
             print(f"\n{'='*60}")
-            print(f"  {name}: {cfg['description']}")
+            print(f"  {name}: {cfg['description']}  [throttle={debug_freeze}]")
             print(f"{'='*60}")
 
         plant = cfg['plant_cls'](seed=seed)
@@ -380,24 +436,13 @@ def run_all(base_lr=1e-3, warmup_steps=100, seed=42, verbose=True):
             n_players=cfg['n_players'],
             base_lr=base_lr,
             warmup_steps=warmup_steps,
-            # === DEFAULTS (not tuned for any scenario) ===
-            stat_window=39,
-            d_filter_window=19,
-            osc_window=24,
-            osc_base_window=399,
-            damper_k=1.0,
-            beta_u=0.3,
+            # === library defaults; only the steering signal source and the
+            # === throttle intent are made explicit ===
             gaps_mode='dynamic',
             dyn_deadband_z=1.0,
-            dyn_floor_min=1e-4,
             integrator_mode='auto',
-            ki=0.02,
-            max_jump_up=1.25,
-            max_jump_down=0.9,
-            k_stab=0.0,
             profile='competitive',
-            osc_preempt_calm=True,
-            osc_require_high_vol=True,
+            debug_freeze=debug_freeze,
         )
 
         history = run_scenario(plant, gb, n_steps=cfg['n_steps'])
@@ -413,79 +458,221 @@ def run_all(base_lr=1e-3, warmup_steps=100, seed=42, verbose=True):
             print(f"\n  KPIs:")
             # Hard invariants
             print(f"    [HARD] comfort_clipped_rate = {kpis['comfort_clipped_rate']:.4f}"
-                  f"  {'✓' if kpis['comfort_clipped_ok'] else '✗ FAIL'}")
+                  f"  {'OK' if kpis['comfort_clipped_ok'] else 'FAIL'}")
             print(f"    [HARD] no_nan_inf           = {kpis['no_nan_inf']}"
-                  f"  {'✓' if kpis['no_nan_inf'] else '✗ FAIL'}")
+                  f"  {'OK' if kpis['no_nan_inf'] else 'FAIL: ' + ','.join(kpis['nan_keys'])}")
+            print(f"    warmup: converged={kpis['warmup_converged']} "
+                  f"degraded={kpis['ramp_degraded']} "
+                  f"db_base={kpis.get('dyn_deadband_z_base', 0):.3f}")
             # Management
             print(f"    mean(u_sat_steer)    = {kpis['mean_u_sat_steer']:.3f}")
             print(f"    mean(wall_lr_any)    = {kpis['mean_wall_lr_any']:.3f}  (I hard-stop)")
-            print(f"    mean(wall_any)       = {kpis['mean_wall_any']:.3f}  (incl u_sat)")
             print(f"    i_effective_rate     = {kpis['i_effective_rate']:.3f}  (I enabled AND not wall)")
             print(f"    mean_u_i_norm        = {kpis['mean_u_i_norm']:.4f}")
-            print(f"    final_u_i_norm       = {kpis['final_u_i_norm']:.4f}")
             print(f"    calm_rate            = {kpis['calm_rate']:.3f}")
-            print(f"    max_toggle_count     = {kpis['max_toggle_count']:.0f}")
             print(f"    governor_dominance   = {kpis['governor_dominance']:.3f}"
-                  f"  {'✓' if kpis['governor_dominance_ok'] else '⚠ high'}")
-            print(f"    gov: raw_jump(mean={kpis.get('gov_raw_jump_mean',0)*100:.2f}% "
-                  f"p95={kpis.get('gov_raw_jump_p95',0)*100:.2f}% "
-                  f"max={kpis.get('gov_raw_jump_max',0)*100:.1f}%) "
-                  f"→ out_mean={kpis.get('gov_output_jump_mean',0)*100:.2f}% "
-                  f"clip_ratio={kpis.get('gov_clip_ratio',0):.1%}")
+                  f"  {'OK' if kpis['governor_dominance_ok'] else 'WARN high'}")
             print(f"    mean(z_max)          = {kpis['mean_z_max']:.2f}")
-            print(f"    mean(ratio_m/m)      = {kpis['mean_ratio_max_over_mean']:.3f}")
-            print(f"    quiet: factor={kpis.get('mean_quiet_factor',1):.3f} "
-                  f"active={kpis.get('quiet_active_rate',0)*100:.1f}% "
-                  f"db_base={kpis.get('dyn_deadband_z_base',0):.3f}")
+            print(f"    authority/panic/meta = {kpis['mean_authority']:.3f} / "
+                  f"{kpis['mean_panic_factor']:.3f} / {kpis['min_climate_lr_meta']:.3f}")
+            print(f"    quiet: factor={kpis.get('mean_quiet_factor', 1):.3f} "
+                  f"active={kpis.get('quiet_active_rate', 0)*100:.1f}%")
 
     return results
 
 
-def print_summary(results):
+def print_summary(results, mode_name=''):
     """Print compact summary table."""
+    title = f"MULTI-SCENARIO SUMMARY ({mode_name})" if mode_name else "MULTI-SCENARIO SUMMARY"
     print(f"\n{'='*100}")
-    print(f"{'MULTI-SCENARIO SUMMARY':^100}")
+    print(f"{title:^100}")
     print(f"{'='*100}")
-    print(f"{'Scenario':<20} {'cc✓':>4} {'nan✓':>5} {'u_sat':>6} {'wlr':>6} "
+    print(f"{'Scenario':<20} {'cc':>4} {'nan':>5} {'degr':>5} {'u_sat':>6} {'wlr':>6} "
           f"{'I_eff':>6} {'ui_n':>6} {'calm':>6} {'gov':>6} {'z_max':>6} "
-          f"{'|gs|':>6} {'|gd|':>6}")
+          f"{'auth':>6} {'|gd|':>6}")
     print('-' * 100)
 
     all_pass = True
     for name, r in results.items():
         k = r['kpis']
-        cc = '✓' if k['comfort_clipped_ok'] else '✗'
-        nn = '✓' if k['no_nan_inf'] else '✗'
+        cc = 'OK' if k['comfort_clipped_ok'] else 'X'
+        nn = 'OK' if k['no_nan_inf'] else 'X'
+        dg = 'yes' if k.get('ramp_degraded') else 'no'
         if not k['comfort_clipped_ok'] or not k['no_nan_inf']:
             all_pass = False
 
-        print(f"{name:<20} {cc:>4} {nn:>5} {k['mean_u_sat_steer']:>6.3f} "
+        print(f"{name:<20} {cc:>4} {nn:>5} {dg:>5} {k['mean_u_sat_steer']:>6.3f} "
               f"{k['mean_wall_lr_any']:>6.3f} {k['i_effective_rate']:>6.3f} "
               f"{k['mean_u_i_norm']:>6.4f} {k['calm_rate']:>6.3f} "
               f"{k['governor_dominance']:>6.3f} {k['mean_z_max']:>6.2f} "
-              f"{k['mean_gaps_steer_abs']:>6.3f} {k['mean_gaps_db_abs']:>6.3f}")
+              f"{k['mean_authority']:>6.3f} {k['mean_gaps_db_abs']:>6.3f}")
 
     print('-' * 100)
-    print(f"Hard invariants: {'ALL PASS ✓' if all_pass else 'FAILURES DETECTED ✗'}")
+    print(f"Hard invariants: {'ALL PASS' if all_pass else 'FAILURES DETECTED'}")
+    return all_pass
 
-    # Calm cause breakdown
-    print(f"\n{'CALM CAUSE BREAKDOWN':^60}")
-    print(f"{'Scenario':<20} {'calm%':>6} {'shock':>7} {'mch_lo':>7} {'mch/lg':>7} {'pre':>7}")
-    print('-' * 60)
-    for name, r in results.items():
-        k = r['kpis']
-        cr = k['calm_rate']
-        if cr > 0.001:
-            print(f"{name:<20} {cr*100:>5.1f}% "
-                  f"{k.get('calm_cause_1_shock',0)*100:>6.1f}% "
-                  f"{k.get('calm_cause_2_mech_lowvol',0)*100:>6.1f}% "
-                  f"{k.get('calm_cause_3_mech_legacy',0)*100:>6.1f}% "
-                  f"{k.get('calm_cause_4_preempt',0)*100:>6.1f}%")
-        else:
-            print(f"{name:<20} {cr*100:>5.1f}%     —       —       —       —")
-    print()
+
+# ================================================================
+# HTML report (single self-contained file, inline panels)
+# ================================================================
+
+def _fig_to_b64(fig):
+    import matplotlib.pyplot as plt
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=95, bbox_inches='tight')
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+def _scenario_panel(history, name, mode_name):
+    """4-panel dynamics figure for one scenario run."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    t = np.arange(len(history['lrs']))
+    lrs = history['lrs']           # (T, N)
+    proxies = history['proxies']   # (T, N)
+    N = lrs.shape[1] if lrs.ndim > 1 else 1
+
+    fig, axes = plt.subplots(4, 1, figsize=(11, 11), sharex=True)
+    fig.suptitle(f"{name}  [{mode_name}]", fontsize=13)
+
+    ax = axes[0]
+    for i in range(N):
+        ax.plot(t, proxies[:, i], lw=0.7, label=f"p{i}")
+    ax.set_ylabel("proxies")
+    ax.legend(loc='upper right', fontsize=8, ncol=min(N, 4))
+    ax.grid(alpha=0.3)
+
+    ax = axes[1]
+    for i in range(N):
+        ax.plot(t, lrs[:, i], lw=0.9, label=f"lr{i}")
+    ax.set_ylabel("LR")
+    ax.set_yscale('log')
+    ax.legend(loc='upper right', fontsize=8, ncol=min(N, 4))
+    ax.grid(alpha=0.3)
+
+    ax = axes[2]
+    ax.plot(t, history['u_p_norm'], lw=0.8, label='|u_p|')
+    ax.plot(t, history['u_i_norm'], lw=0.8, label='|u_i|')
+    ax.plot(t, history['gaps_db_abs'], lw=0.7, label='|gaps_db|')
+    ax.plot(t, np.minimum(history['z_max'], 10.0), lw=0.5, alpha=0.6, label='z_max (cap 10)')
+    ax.plot(t, history['dyn_deadband_z_eff'], lw=0.8, ls='--', label='deadband_eff')
+    ax.set_ylabel("steering")
+    ax.legend(loc='upper right', fontsize=8, ncol=3)
+    ax.grid(alpha=0.3)
+
+    ax = axes[3]
+    ax.plot(t, history['authority_factor'], lw=0.9, label='authority')
+    ax.plot(t, history['panic_factor'], lw=0.9, label='panic_factor')
+    ax.plot(t, history['climate_lr_meta'], lw=0.9, label='lr_meta')
+    ax.plot(t, history['quiet_factor'], lw=0.7, alpha=0.7, label='quiet')
+    calm = history.get('calm', np.zeros(len(t)))
+    trip = history.get('trip_active', np.zeros(len(t)))
+    if np.any(calm > 0.5):
+        ax.fill_between(t, 0, 1.05, where=calm > 0.5, color='red', alpha=0.12, label='calm')
+    if np.any(trip > 0.5):
+        ax.fill_between(t, 0, 1.05, where=trip > 0.5, color='orange', alpha=0.12, label='trip')
+    ax.set_ylabel("safety [0..1]")
+    ax.set_ylim(-0.05, 1.1)
+    ax.set_xlabel("post-warmup step")
+    ax.legend(loc='lower right', fontsize=8, ncol=3)
+    ax.grid(alpha=0.3)
+
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+_KPI_ROWS = [
+    ('warmup_converged', 'warmup converged'),
+    ('ramp_degraded', 'degraded'),
+    ('dyn_deadband_z_base', 'deadband base'),
+    ('mean_u_sat_steer', 'u_sat mean'),
+    ('mean_wall_lr_any', 'wall_lr mean'),
+    ('i_effective_rate', 'I effective'),
+    ('mean_u_i_norm', '|u_i| mean'),
+    ('calm_rate', 'calm rate'),
+    ('mean_z_max', 'z_max mean'),
+    ('mean_authority', 'authority mean'),
+    ('mean_panic_factor', 'panic mean'),
+    ('min_climate_lr_meta', 'lr_meta min'),
+]
+
+
+def render_html_report(all_results, out_path='harness_report.html', keep=False):
+    """One self-contained HTML: every scenario × mode, panels inline.
+
+    Overwritten on every run BY DESIGN — the report is a pure function of
+    the current code; history is reproducible from git. keep=True saves an
+    additional timestamped copy.
+    """
+    stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    parts = [
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>",
+        "<title>GravBalancer harness report</title>",
+        "<style>body{font-family:sans-serif;margin:20px;background:#fafafa}"
+        "h2{border-bottom:2px solid #888}table{border-collapse:collapse;font-size:13px}"
+        "td,th{border:1px solid #ccc;padding:3px 8px}th{background:#eee}"
+        ".fail{color:#b00;font-weight:bold}.ok{color:#080}"
+        "img{max-width:100%;border:1px solid #ddd;margin:6px 0}</style></head><body>",
+        f"<h1>GravBalancer harness report</h1>"
+        f"<p>generated: {stamp} | grav_balancer v10.9 | overwritten each run (history = git)</p>",
+    ]
+
+    for mode_name, results in all_results.items():
+        parts.append(f"<h2>throttle mode: {mode_name}</h2>")
+        for name, r in results.items():
+            k = r['kpis']
+            inv = ('<span class="ok">PASS</span>'
+                   if k['no_nan_inf'] and k['comfort_clipped_ok']
+                   else f'<span class="fail">FAIL (nan: {", ".join(k.get("nan_keys", [])) or "-"};'
+                        f' comfort_clipped={k["comfort_clipped_rate"]:.4f})</span>')
+            parts.append(f"<h3>{name} — {inv}</h3>")
+            rows = ''.join(
+                f"<tr><th>{label}</th><td>{k.get(key, '')if not isinstance(k.get(key), float) else f'{k[key]:.4f}'}</td></tr>"
+                for key, label in _KPI_ROWS)
+            parts.append(f"<table>{rows}</table>")
+            fig = _scenario_panel(r['history'], name, mode_name)
+            parts.append(f"<img src='data:image/png;base64,{_fig_to_b64(fig)}'/>")
+
+    parts.append("</body></html>")
+    html = '\n'.join(parts)
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    if keep:
+        ts_path = out_path.replace('.html', time.strftime('_%Y%m%d_%H%M%S.html'))
+        with open(ts_path, 'w', encoding='utf-8') as f:
+            f.write(html)
+        return out_path, ts_path
+    return out_path, None
+
+
+def main(base_lr=1e-3, warmup_steps=100, seed=42, report=True, keep=False,
+         verbose=True):
+    """Run all scenarios in both throttle modes; render the HTML report."""
+    all_results = {}
+    all_pass = True
+    for mode_name, freeze in MODES.items():
+        results = run_all(base_lr=base_lr, warmup_steps=warmup_steps,
+                          seed=seed, verbose=verbose, debug_freeze=freeze)
+        all_pass &= print_summary(results, mode_name)
+        all_results[mode_name] = results
+
+    if report:
+        try:
+            path, kept = render_html_report(all_results, keep=keep)
+            print(f"\nHTML report: {os.path.abspath(path)}"
+                  + (f" (+ kept copy: {kept})" if kept else ""))
+        except ImportError:
+            print("\nmatplotlib not available — HTML report skipped.")
+
+    print(f"\nOVERALL: {'ALL PASS' if all_pass else 'FAILURES DETECTED'}")
+    return all_results, all_pass
 
 
 if __name__ == '__main__':
-    results = run_all(base_lr=1e-3, warmup_steps=100, seed=42)
-    print_summary(results)
+    keep_flag = '--keep' in sys.argv
+    no_report = '--no-report' in sys.argv
+    _, ok = main(report=not no_report, keep=keep_flag)
+    sys.exit(0 if ok else 1)

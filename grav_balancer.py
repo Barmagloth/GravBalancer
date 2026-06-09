@@ -1,5 +1,5 @@
 # grav_balancer.py
-# GravBalancer v10.8
+# GravBalancer v10.9
 #
 # Adaptive learning rate controller for N-player optimization.
 # Scenario-agnostic: works across cooperative, adversarial, and mixed regimes.
@@ -61,6 +61,25 @@
 # ═══════════════════════════════════════════════════════════════
 # Version history (consolidated at v10.8)
 # ═══════════════════════════════════════════════════════════════
+# v10.9:   Repair release (tiers 0-4 of docs/repair_plan_v1_0.md):
+#          - Input contract: proxy >= 0; gross negatives raise ValueError,
+#            tiny negatives (FP noise, within 1e-6 x scale) are clamped with
+#            a one-time warning (was: silent clip of ALL negatives destroying
+#            hinge/WGAN proxy signal).
+#          - Warmup feasibility: convergence_window=None auto-scales from
+#            warmup_steps; explicit infeasible config raises; degraded exit
+#            emits warnings.warn + degraded_reason metric (was: silent
+#            degraded for warmup_steps < ~400 — all v10.8.x CIFAR sweeps).
+#          - reset_state(): restores dyn_deadband_z/_ramp_steps_total from
+#            constructor snapshots (was: calibration leak across resets,
+#            cumulative ramp doubling).
+#          - Zero-sum invariant for N>2: projection onto {mean=0} ∩ box
+#            (was: clip after zero-mean shifted mean(lrs) up to ~10%).
+#          - Saturation measured against active-phase cap, not ramp-scaled
+#            (was: soft-start artifacts polluted stress/panic/climate-E).
+#          - last_metrics updated on warmup snap step (was: stale dict).
+#          - Removed dead params k_stab/noise_db/stab_min (no-ops since
+#            v10.7.0; loud TypeError at stale call-sites is intentional).
 # v10.8:   Cleanup release. No behavioral changes from v10.7.11.
 #          Fixed encoding, removed dead code, consolidated state init,
 #          cleaned naming and comments, verified N-invariance.
@@ -79,6 +98,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from collections import deque
 from typing import List, Literal, Optional, Tuple
 
@@ -92,11 +112,12 @@ def _window_to_alpha(window: int) -> float:
 
 class GravBalancer:
     """
-    GravBalancer v10.8
+    GravBalancer v10.9
 
     Adaptive learning rate controller for N players.
     Manages dynamics based on observable stress proxies.
     Does NOT interpret proxy semantics -- scenario-agnostic by design.
+    Input contract: proxies must be non-negative scalars (see _coerce_inputs).
     """
 
     def __init__(
@@ -158,9 +179,6 @@ class GravBalancer:
         gov_noise_sensitivity: float = 3.0,
 
         # --- Throttle (§8) ---
-        k_stab: float = 4.0,            # stability throttle steepness
-        noise_db: float = 0.3,          # stability deadband (noise_norm below this → no penalty)
-        stab_min: float = 0.2,          # floor for stability factor
         boost_max: float = 0.1,         # max comfort boost above 1.0
         noise_boost_thr: float = 0.5,   # noise_norm below this → comfort eligible
         boost_min_duration: int = 20,   # min steps of quiet before boost kicks in
@@ -224,7 +242,7 @@ class GravBalancer:
         warmup_steps: int = 1000,
 
         # --- Convergence-based warmup ---
-        convergence_window: int = 200,           # steps per observation window
+        convergence_window: Optional[int] = None,  # steps per window; None → auto-scale from warmup_steps
         convergence_cv_thr: float = 0.3,         # CV threshold for stability
         convergence_growth_thr: float = 1.15,    # growth threshold (geo-mean log-ratio)
         convergence_n_confirm: int = 3,          # consecutive windows to confirm
@@ -291,6 +309,7 @@ class GravBalancer:
         self._warmup_z_samples = []  # collect |z| during warmup for percentile calibration
         self._warmup_z_n = 0
         self._warmup_z_pct_raw = float('nan')
+        self._neg_proxy_warned = False  # one-time warning for tiny negative proxies
 
         # Integrator params
         self.integrator_mode = integrator_mode
@@ -323,9 +342,11 @@ class GravBalancer:
         self._gov_jump_down_floor = 0.75
 
         # Throttle
-        self.k_stab = float(k_stab)
-        self.noise_db = float(noise_db)
-        self.stab_min = float(stab_min)
+        # (v10.9) Dead trio k_stab/noise_db/stab_min REMOVED from signature.
+        # Superseded by k_auth/auth_db/auth_min in v10.7.0; silent no-ops since.
+        # Removal is deliberately loud (TypeError at stale call-sites) — the
+        # silent-compat variant inverted the meaning of harness's k_stab=0.0
+        # ("throttle off") without anyone noticing.
         self.boost_max = float(boost_max)
         self.noise_boost_thr = float(noise_boost_thr)
         self.boost_min_duration = int(boost_min_duration)
@@ -403,11 +424,42 @@ class GravBalancer:
         self.warmup_steps = int(warmup_steps)
 
         # Convergence-based warmup
-        self.convergence_window = int(convergence_window)
         self.convergence_cv_thr = float(convergence_cv_thr)
         self.convergence_growth_thr = float(convergence_growth_thr)
         self.convergence_n_confirm = int(convergence_n_confirm)
         self.max_warmup_steps = int(warmup_steps * max_warmup_mult)
+        # (v10.9) Feasibility-aware convergence window.
+        # Converged exit needs convergence_window × n_checks steps, where
+        # n_checks = max(n_confirm+1, 3) + n_confirm - 1 (window boundaries
+        # to fill min_windows, then n_confirm consecutive confirmations).
+        # The old fixed default (200) made convergence ARITHMETICALLY
+        # impossible for warmup_steps < ~400 → silent degraded mode with
+        # deadband pinned at max (all v10.8.x CIFAR sweeps ran like that).
+        _n_checks = (max(self.convergence_n_confirm + 1, 3)
+                     + self.convergence_n_confirm - 1)
+        if convergence_window is None:
+            _w_auto = int(self.max_warmup_steps * 0.8 / max(_n_checks, 1))
+            self.convergence_window = int(np.clip(_w_auto, 20, 200))
+            self._convergence_window_auto = True
+            if self.convergence_window * _n_checks > self.max_warmup_steps:
+                warnings.warn(
+                    f"GravBalancer: warmup_steps={warmup_steps} is too short for "
+                    f"any convergence check (earliest converged exit "
+                    f"{self.convergence_window * _n_checks} > max_warmup_steps "
+                    f"{self.max_warmup_steps}). Warmup will exit DEGRADED "
+                    f"(deadband pinned at dyn_deadband_z_max). Increase warmup_steps.")
+        else:
+            self.convergence_window = int(convergence_window)
+            self._convergence_window_auto = False
+            _earliest = self.convergence_window * _n_checks
+            if _earliest > self.max_warmup_steps:
+                raise ValueError(
+                    f"Convergence arithmetically impossible: earliest converged exit "
+                    f"= convergence_window({self.convergence_window}) × {_n_checks} "
+                    f"= {_earliest} > max_warmup_steps({self.max_warmup_steps}). "
+                    f"Warmup would ALWAYS exit degraded. Increase warmup_steps / "
+                    f"max_warmup_mult, reduce convergence_window, or pass "
+                    f"convergence_window=None for auto-scale.")
         self.ramp_i_gate = float(ramp_i_gate)
         # N-invariant: strict for small N, robust for large N
         if warmup_ok_frac_thr is not None:
@@ -418,6 +470,13 @@ class GravBalancer:
         self._warmup_q = 1.0 if self.N <= 2 else float(warmup_q_robust)
         self._warmup_q_snap = 1.0 if self.N <= 2 else float(warmup_q_snap)
         self._ramp_steps_total = int(warmup_steps)  # ramp = min_warmup length
+        # (v10.9) Immutable snapshots of constructor values mutated at runtime
+        # (warmup calibration / degraded mode). reset_state() restores from
+        # these — previously calibration leaked across resets: dyn_deadband_z
+        # kept the prior run's calibrated value (3.5 after degraded) and
+        # _ramp_steps_total doubled cumulatively on every degraded exit.
+        self._init_dyn_deadband_z = float(dyn_deadband_z)
+        self._init_ramp_steps_total = int(warmup_steps)
 
         # Climate control
         self._climate_alpha_fast_up = _window_to_alpha(climate_tau_fast)
@@ -595,6 +654,7 @@ class GravBalancer:
         self._ramp_progress = 0.0
         self._ramp_steps_done = 0
         self._ramp_degraded = False  # True if B timed out
+        self._degraded_reason = ''   # '' | 'timeout' | 'no_phase_b'
         # Per-player shock accumulator for convergence windows
         self._conv_shock_accum = np.zeros(self.N, dtype=np.float64)  # mus-change for convergence
         self._conv_resid_accum = np.zeros(self.N, dtype=np.float64)  # resid for snap (same units as _shock_ema)
@@ -636,9 +696,15 @@ class GravBalancer:
         self._d_baseline = np.zeros(self.N, dtype=np.float64)
         self._quiet_factor = 1.0
         self._warmup_z_samples = []
-        self.dyn_deadband_z_base = self.dyn_deadband_z
+        # (v10.9) Restore from constructor snapshots. Previous behavior copied
+        # the MUTATED runtime value into base — calibration (or the degraded
+        # 3.5 pin) leaked into every subsequent run after reset.
+        self.dyn_deadband_z = self._init_dyn_deadband_z
+        self.dyn_deadband_z_base = self._init_dyn_deadband_z
+        self._ramp_steps_total = self._init_ramp_steps_total
         self._warmup_z_n = 0
         self._warmup_z_pct_raw = float('nan')
+        self._neg_proxy_warned = False
         self._i_enabled = (self.integrator_mode != "off")
         self._sat_ema = 0.0
         self._hold_ema = 0.0
@@ -731,6 +797,7 @@ class GravBalancer:
         self._ramp_progress = 0.0
         self._ramp_steps_done = 0
         self._ramp_degraded = False
+        self._degraded_reason = ''
         self._conv_shock_accum = np.zeros(self.N, dtype=np.float64)
         self._conv_resid_accum = np.zeros(self.N, dtype=np.float64)
         self._conv_window_count = 0
@@ -972,7 +1039,10 @@ class GravBalancer:
         # Ramp_factor scales steering authority during soft-start
         _ramp = self._ramp_factor if self._warmup_phase in ('ramp',) else 1.0
         u_cap_eff = self.u_cap * authority_factor * _ramp
-        u_total_zm = np.clip(u_total_zm_preclip, -u_cap_eff, u_cap_eff)
+        # (v10.9) Plain clip after zero-mean broke the zero-sum invariant for
+        # N>2 (asymmetric clipping shifts the mean → mean(lrs) drifted from
+        # base_lr×panic_factor by up to ~10%). Project onto {mean=0} ∩ box.
+        u_total_zm = self._project_zero_sum_box(u_total_zm_preclip, u_cap_eff)
 
         # Climate anti-chatter hold (1-step lag from prev step's E_fast)
         # Zero steering to prevent noise injection during storms.
@@ -988,8 +1058,15 @@ class GravBalancer:
         lrs_gov, hold_lr = self._rate_governor(lrs_clamped)
 
         # ━━━ Saturation detection (Step 1: split steer vs wall) ━━━
-        u_sat_steer = np.abs(u_total_zm) >= (u_cap_eff - 1e-9)
-        u_sat_steer_mean = float(np.mean(np.abs(u_total_zm) / max(u_cap_eff, 1e-12)))
+        # (v10.9) Saturation is measured against the ACTIVE-phase allowance
+        # (no ramp factor). During early ramp u_cap_eff ≈ 0, so any nonzero
+        # command read as "saturated", polluting control_stress / panic /
+        # climate-E with soft-start artifacts (E reached the hold threshold
+        # 2.0 from saturation that existed only because the cap was ~1e-7).
+        # In active phase _sat_cap == u_cap_eff — behavior unchanged.
+        _sat_cap = max(self.u_cap * authority_factor, 1e-12)
+        u_sat_steer = np.abs(u_total_zm) >= (_sat_cap - 1e-9)
+        u_sat_steer_mean = float(np.mean(np.abs(u_total_zm) / _sat_cap))
         # Fraction of players at saturation (mean, N-invariant)
         u_sat_frac = float(np.mean(u_sat_steer.astype(float)))
         lr_wall_pre = lr_clamped_flag or bool(np.any(hold_lr))
@@ -1321,29 +1398,41 @@ class GravBalancer:
                 if converged:
                     self._warmup_converged = True
                     self._take_warmup_snaps(warmup_raw_d if self.step > 1 else None)
-                    return [float(x) for x in self.prev_lrs]
+                    return self._finish_warmup_step(rel_vol)
 
             # Hard ceiling: max warmup reached → degraded exit
             if self.step >= self.max_warmup_steps:
                 self._warmup_converged = False
                 self._ramp_degraded = True
+                self._degraded_reason = 'timeout'
                 self._take_warmup_snaps(warmup_raw_d if self.step > 1 else None)
-                return [float(x) for x in self.prev_lrs]
+                return self._finish_warmup_step(rel_vol)
 
         # Phase A end-of-min-warmup: if phase B would have zero steps
         # (max_warmup_steps == warmup_steps), take snaps immediately
         if self._warmup_phase == 'B' and self.max_warmup_steps <= self.warmup_steps:
             self._warmup_converged = False
             self._ramp_degraded = True
+            self._degraded_reason = 'no_phase_b'
             self._take_warmup_snaps(warmup_raw_d if self.step > 1 else None)
-            return [float(x) for x in self.prev_lrs]
+            return self._finish_warmup_step(rel_vol)
 
+        return self._finish_warmup_step(rel_vol)
+
+    def _finish_warmup_step(self, rel_vol: float) -> List[float]:
+        """(v10.9) Single exit point for all warmup-phase returns.
+
+        Previously the snap-taking paths returned early WITHOUT updating
+        last_metrics, leaving the previous step's dict visible exactly on
+        the step where warmup state changed.
+        """
         self.last_metrics = {
             "warmup": True, "step": int(self.step),
             "warmup_phase": self._warmup_phase,
             "warmup_converged": int(self._warmup_converged),
-            "ramp_factor": 0.0,
+            "ramp_factor": float(self._ramp_factor),
             "ramp_degraded": int(self._ramp_degraded),
+            "degraded_reason": self._degraded_reason,
             "shock": float(self._shock),
             "rel_vol": float(rel_vol),
             "osc_risk": float(self.osc_risk),
@@ -1506,6 +1595,15 @@ class GravBalancer:
 
         # Degraded mode adjustments
         if self._ramp_degraded:
+            # (v10.9) Degraded exit is no longer silent — it pins the deadband
+            # at max and disables I-term for the whole ramp, i.e. the steering
+            # is nearly inert for the rest of the run.
+            warnings.warn(
+                f"GravBalancer warmup exited DEGRADED at step {self.step} "
+                f"(reason: {self._degraded_reason or 'timeout'}): convergence not "
+                f"confirmed within max_warmup_steps={self.max_warmup_steps}. "
+                f"Deadband pinned at {self.dyn_deadband_z_max}σ; steering will be "
+                f"nearly inert. Check warmup_steps vs convergence_window.")
             self._ramp_steps_total = self._ramp_steps_total * 2
             self.dyn_deadband_z_base = self.dyn_deadband_z_max
             self.dyn_deadband_z = self.dyn_deadband_z_max
@@ -1532,9 +1630,31 @@ class GravBalancer:
         if len(proxies) != self.N:
             raise ValueError(f"Expected {self.N} proxies, got {len(proxies)}")
         arr = np.asarray(proxies, dtype=np.float64)
-        arr = np.maximum(arr, 0.0)
         if not np.isfinite(arr).all():
             raise ValueError("Proxies contain NaN/Inf.")
+        neg = arr < 0.0
+        if np.any(neg):
+            # (v10.9, amendment П1) Contract: proxy >= 0, with a tolerance
+            # band. Tiny negatives (FP noise in custom proxies) are clamped
+            # with a ONE-TIME warning — a hard raise here would kill a long
+            # run over -1e-12 at step 50000 (anti-survival). Gross negatives
+            # still raise: they mean the proxy is sign-changing and half its
+            # dynamic range would be silently destroyed (the v10.8 failure
+            # mode this contract exists to prevent).
+            tol = 1e-6 * float(np.mean(np.abs(arr))) + 1e-12
+            if np.any(arr < -tol):
+                raise ValueError(
+                    f"GravBalancer proxies must be non-negative, got {arr.tolist()}. "
+                    "Internal scales (ref_scale_ema, rel_vol, shock) assume a positive "
+                    "scale. For sign-changing losses wrap them monotonically, e.g. "
+                    "softplus(loss), instead of passing raw or ReLU-clipped values.")
+            if not self._neg_proxy_warned:
+                warnings.warn(
+                    f"GravBalancer: tiny negative proxy clamped to 0 "
+                    f"(min={float(arr.min()):.3e}, tol={tol:.3e}). "
+                    "Warned once; further occurrences are clamped silently.")
+                self._neg_proxy_warned = True
+            arr = np.where(neg, 0.0, arr)
         return arr
 
     def _update_stats(self, vals: np.ndarray) -> None:
@@ -1733,6 +1853,28 @@ class GravBalancer:
 
         z = max(0.0, self.noise_boost_thr - noise_norm) / max(self.noise_boost_thr, 1e-9)
         return 1.0 + self.boost_max * z
+
+    # ================================================================= Zero-sum projection (§9)
+
+    def _project_zero_sum_box(self, u: np.ndarray, cap: float) -> np.ndarray:
+        """(v10.9) Project a vector onto {mean = 0} ∩ [-cap, cap]^N.
+
+        Alternating projection (clip ↔ re-center); the intersection is
+        non-empty (0 lies in both sets), convergence is fast in practice.
+        For N=2 the zero-mean vector is symmetric (±a), so plain clip was
+        already correct — behavior unchanged. For N>2 this restores the
+        documented invariant mean(lrs_raw) = base_lr × panic_factor.
+        """
+        if cap <= 0.0:
+            return np.zeros_like(u)
+        v = u - float(np.mean(u))
+        for _ in range(50):
+            v_c = np.clip(v, -cap, cap)
+            drift = float(np.mean(v_c))
+            if abs(drift) <= 1e-15:
+                return v_c
+            v = v_c - drift
+        return np.clip(v, -cap, cap)
 
     # ================================================================= Ratio clamp (§9)
 
