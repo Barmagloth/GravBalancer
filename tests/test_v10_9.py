@@ -232,6 +232,51 @@ def test_no_ramp_saturation_artifact():
     assert max_E < 2.0, f"climate_E inflated during ramp: {max_E}"
 
 
+# ───────────────────────────── v10.9.1: climate winsorization (К1)
+
+def test_climate_winsor_single_spike_bounded():
+    # Observed on toy seed-42: one spike E=8021 ratcheted E_slow for ~46 epochs.
+    gb = GravBalancer(n_players=2, warmup_steps=1000)
+    gb._climate_E_slow = 1.0
+    gb._update_climate(resid_pp=np.array([8000.0, 8000.0]), shock_thr=1.0,
+                       wall_rate_ema=0.0, u_sat_frac=0.0, clamp_frac=0.0)
+    assert gb._climate_E > 100, "raw E (diagnostics) must still see the spike"
+    assert gb._climate_E_slow < 1.02, \
+        f"E_slow input must be winsorized, got {gb._climate_E_slow}"
+
+
+def test_climate_winsor_sustained_storm_still_brakes():
+    gb = GravBalancer(n_players=2, warmup_steps=1000)
+    for _ in range(4000):
+        gb._update_climate(np.array([5.0, 5.0]), 1.0, 0.0, 0.0, 0.0)
+    assert gb._climate_E_slow > 3.0, "sustained storm must still raise E_slow"
+    assert gb._climate_lr_meta < 0.4, "sustained storm must still brake lr_meta"
+
+
+def test_climate_winsor_disable_restores_old():
+    gb = GravBalancer(n_players=2, warmup_steps=1000, climate_E_winsor_mult=0.0)
+    gb._climate_E_slow = 1.0
+    gb._update_climate(np.array([8000.0, 8000.0]), 1.0, 0.0, 0.0, 0.0)
+    assert gb._climate_E_slow > 10, "winsor disabled must restore old ratchet"
+
+
+def test_ds_lambda_preclamp_logged():
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        print("  (skipped: torch unavailable)")
+        return
+    import torch
+    from diversity_sentinel import make_sentinel_for_toy
+    ds = make_sentinel_for_toy(warmup_steps=1)
+    fake, real = torch.randn(32, 2), torch.randn(32, 2)
+    ds.compute(fake, real)
+    for _ in range(3):
+        ds.step(1.0, 32)
+    _, info = ds.compute(fake, real)
+    assert 'div/lambda_pid_preclamp' in info
+
+
 # ───────────────────────────── Harness integration
 
 def test_harness_no_nan_keys():

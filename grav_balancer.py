@@ -1,5 +1,5 @@
 # grav_balancer.py
-# GravBalancer v10.9
+# GravBalancer v10.9.1
 #
 # Adaptive learning rate controller for N-player optimization.
 # Scenario-agnostic: works across cooperative, adversarial, and mixed regimes.
@@ -61,6 +61,12 @@
 # ═══════════════════════════════════════════════════════════════
 # Version history (consolidated at v10.8)
 # ═══════════════════════════════════════════════════════════════
+# v10.9.1: Climate fix К1 (repair_plan addendum d): winsorize the E_slow
+#          INPUT at E_slow × climate_E_winsor_mult (default 3.0; ≤0 restores
+#          old behavior). E_fast/hold keep raw E. Observed on toy seed-42:
+#          one explosion (E=8021) at ep2.4 pinned lr_meta≈0.01..0.2 for the
+#          remaining ~78 epochs (τ≈5000 steps). Storms are now measured by
+#          duration, not by the amplitude of a single spike.
 # v10.9:   Repair release (tiers 0-4 of docs/repair_plan_v1_0.md):
 #          - Input contract: proxy >= 0; gross negatives raise ValueError,
 #            tiny negatives (FP noise, within 1e-6 x scale) are clamped with
@@ -112,7 +118,7 @@ def _window_to_alpha(window: int) -> float:
 
 class GravBalancer:
     """
-    GravBalancer v10.9
+    GravBalancer v10.9.1
 
     Adaptive learning rate controller for N players.
     Manages dynamics based on observable stress proxies.
@@ -264,6 +270,7 @@ class GravBalancer:
         climate_slew_down: float = 0.05,         # lr_meta max decrease per step
         climate_slew_up: float = 0.01,           # lr_meta max increase per step
         climate_E_deadband: float = 0.02,        # E_slow must exceed 1+this before lr_meta responds
+        climate_E_winsor_mult: float = 3.0,      # (v10.9.1) clip E_slow INPUT to E_slow×this; ≤0 disables
         abs_lr_floor: Optional[float] = None,    # absolute LR floor after climate (None = base_lr*0.001)
 
         # --- Profile (§12) ---
@@ -490,6 +497,7 @@ class GravBalancer:
         self.climate_slew_down = float(climate_slew_down)
         self.climate_slew_up = float(climate_slew_up)
         self._climate_E_deadband = float(climate_E_deadband)
+        self._climate_E_winsor_mult = float(climate_E_winsor_mult)
         self._abs_lr_floor = float(abs_lr_floor) if abs_lr_floor is not None else self.base_lr * 0.001
 
         # Profile
@@ -2104,21 +2112,33 @@ class GravBalancer:
                 1.0 + wall_rate_ema,
                 1.0 + u_sat_frac,
                 1.0 + clamp_frac)
-        self._climate_E = E
+        self._climate_E = E  # diagnostics keep the RAW value
 
-        # ── E_fast: catches spikes (tau ~30 steps) ──
+        # ── E_fast: catches spikes (tau ~30 steps) — RAW E by design ──
+        # (anti-chatter hold is the spike reflex; winsorizing it would dull
+        # exactly the reaction it exists for)
         if E > self._climate_E_fast:
             a_fast = self._climate_alpha_fast_up      # tighten: track quickly
         else:
             a_fast = self._climate_alpha_fast_down     # relax: release slowly
         self._climate_E_fast = (1.0 - a_fast) * self._climate_E_fast + a_fast * E
 
-        # ── E_slow: chronic storm (tau ~1000 steps) ──
-        if E > self._climate_E_slow:
+        # ── E_slow: chronic storm (tau ~1000 steps) — WINSORIZED input ──
+        # (v10.9.1, К1) Clip E relative to current E_slow (pattern: noise_ref
+        # winsorization). Unwinsorized single spikes (E≈8021 observed on toy
+        # 1e-2, 2026-06-10) ratcheted E_slow into ~46 epochs of braking —
+        # "chronic storm tracker" degenerated into scar tissue from one event.
+        # A sustained storm still raises E_slow exponentially (up to ×winsor
+        # per crossing); a single spike contributes at most one bounded step.
+        if self._climate_E_winsor_mult > 0:
+            E_sl = min(E, max(self._climate_E_slow, 1.0) * self._climate_E_winsor_mult)
+        else:
+            E_sl = E
+        if E_sl > self._climate_E_slow:
             a_slow = self._climate_alpha_slow_up       # tighten
         else:
             a_slow = self._climate_alpha_slow_down     # relax (very slow)
-        self._climate_E_slow = (1.0 - a_slow) * self._climate_E_slow + a_slow * E
+        self._climate_E_slow = (1.0 - a_slow) * self._climate_E_slow + a_slow * E_sl
 
         # ── lr_meta = f(E_slow): climate control signal ──
         x = max(0.0, self._climate_E_slow - 1.0 - self._climate_E_deadband)
