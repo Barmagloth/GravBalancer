@@ -1,5 +1,5 @@
 # diversity_sentinel.py
-# DiversitySentinel v2.2 — Standalone anti-mode-collapse module
+# DiversitySentinel v2.2.1 — Standalone anti-mode-collapse module
 #
 # Operates alongside GravBalancer (v10.8+) without modifying it.
 # GravBalancer manages learning rates (outer loop).
@@ -19,6 +19,11 @@
 #   4. GravBalancer is NEVER modified — Sentinel is a pure add-on
 #
 # Version history:
+#   v2.2.1: Diagnostics only, behavior bit-identical: expose raw PID output
+#         BEFORE [lambda_min, lambda_max] clamp as _lambda_pid_preclamp /
+#         info["div/lambda_pid_preclamp"]. The previously logged
+#         "div/lambda_raw_pid" is post-clamp, which made "is the PID pinned
+#         at the floor?" unanswerable from logs (sweep 2026-06-10).
 #   v2.2: Repair release (docs/repair_plan_v1_0.md tier 1):
 #         - cfg default is no longer a mutable class-level instance
 #           (was: single shared DiversitySentinelConfig across all
@@ -200,7 +205,8 @@ class DiversitySentinel:
         # ── Lambda governor state ──
         self._lambda_prev: float = cfg.lambda_min  # previous governed lambda
         self._lambda_smooth: float = 0.0           # EMA-smoothed output
-        self._lambda_raw_pid: float = 0.0          # diagnostics
+        self._lambda_raw_pid: float = 0.0          # diagnostics (post-clamp)
+        self._lambda_pid_preclamp: float = 0.0     # diagnostics (raw PID desire)
 
         # ── GravBalancer coordination ──
         self._grav_calm: bool = False
@@ -462,6 +468,7 @@ class DiversitySentinel:
             "div/grav_distress_level": self._grav_distress_level,
             "div/grav_distress_kind": self._grav_distress_kind,
             "div/lambda_raw_pid": self._lambda_raw_pid,
+            "div/lambda_pid_preclamp": self._lambda_pid_preclamp,
             "div/lambda_prev": self._lambda_prev,
             "div/loss_total": total_loss.item(),
             "div/spread_fake_batch": r_fake.var().item(),
@@ -501,6 +508,10 @@ class DiversitySentinel:
             new_lambda = self._update_pid(loss_G_main, raw_error)
         else:
             new_lambda = self.cfg.lambda_min
+
+        # (v2.2.1) raw PID desire BEFORE the [min, max] clamp — the only
+        # signal that answers "is lambda pinned at the floor by the PID?"
+        self._lambda_pid_preclamp = float(new_lambda)
 
         new_lambda = max(self.cfg.lambda_min,
                          min(new_lambda, self.cfg.lambda_max))
@@ -564,6 +575,7 @@ class DiversitySentinel:
         self._lambda_prev = self.cfg.lambda_min
         self._lambda_smooth = 0.0
         self._lambda_raw_pid = 0.0
+        self._lambda_pid_preclamp = 0.0
         self._grav_calm = False
         self._grav_calm_cause = 0
         self._grav_distress_level = 0
