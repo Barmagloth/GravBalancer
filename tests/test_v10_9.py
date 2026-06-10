@@ -234,9 +234,18 @@ def test_no_ramp_saturation_artifact():
 
 # ───────────────────────────── v10.9.1: climate winsorization (К1)
 
-def test_climate_winsor_single_spike_bounded():
-    # Observed on toy seed-42: one spike E=8021 ratcheted E_slow for ~46 epochs.
+def test_climate_default_is_v109_ratchet():
+    # (v10.9.2) К1 default OFF: the unwinsorized ratchet is the de-facto
+    # emergency brake (seed-42 2e-2: lr_meta 0.058 -> survived; К1 -> died).
     gb = GravBalancer(n_players=2, warmup_steps=1000)
+    assert gb._climate_E_winsor_mult == 0.0
+    gb._climate_E_slow = 1.0
+    gb._update_climate(np.array([8000.0, 8000.0]), 1.0, 0.0, 0.0, 0.0)
+    assert gb._climate_E_slow > 10, "default must keep the fast emergency ratchet"
+
+
+def test_climate_winsor_optin_single_spike_bounded():
+    gb = GravBalancer(n_players=2, warmup_steps=1000, climate_E_winsor_mult=3.0)
     gb._climate_E_slow = 1.0
     gb._update_climate(resid_pp=np.array([8000.0, 8000.0]), shock_thr=1.0,
                        wall_rate_ema=0.0, u_sat_frac=0.0, clamp_frac=0.0)
@@ -245,19 +254,12 @@ def test_climate_winsor_single_spike_bounded():
         f"E_slow input must be winsorized, got {gb._climate_E_slow}"
 
 
-def test_climate_winsor_sustained_storm_still_brakes():
-    gb = GravBalancer(n_players=2, warmup_steps=1000)
+def test_climate_winsor_optin_sustained_storm_still_brakes():
+    gb = GravBalancer(n_players=2, warmup_steps=1000, climate_E_winsor_mult=3.0)
     for _ in range(4000):
         gb._update_climate(np.array([5.0, 5.0]), 1.0, 0.0, 0.0, 0.0)
     assert gb._climate_E_slow > 3.0, "sustained storm must still raise E_slow"
     assert gb._climate_lr_meta < 0.4, "sustained storm must still brake lr_meta"
-
-
-def test_climate_winsor_disable_restores_old():
-    gb = GravBalancer(n_players=2, warmup_steps=1000, climate_E_winsor_mult=0.0)
-    gb._climate_E_slow = 1.0
-    gb._update_climate(np.array([8000.0, 8000.0]), 1.0, 0.0, 0.0, 0.0)
-    assert gb._climate_E_slow > 10, "winsor disabled must restore old ratchet"
 
 
 def test_ds_lambda_preclamp_logged():

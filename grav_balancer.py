@@ -1,5 +1,5 @@
 # grav_balancer.py
-# GravBalancer v10.9.1
+# GravBalancer v10.9.2
 #
 # Adaptive learning rate controller for N-player optimization.
 # Scenario-agnostic: works across cooperative, adversarial, and mixed regimes.
@@ -61,6 +61,14 @@
 # ═══════════════════════════════════════════════════════════════
 # Version history (consolidated at v10.8)
 # ═══════════════════════════════════════════════════════════════
+# v10.9.2: К1 winsorization DEFAULT REVERTED to OFF (climate_E_winsor_mult=0).
+#          Seed-42 2e-2 data: pre-К1 the unwinsorized ratchet acted as the
+#          de-facto EMERGENCY brake (lr_meta dips to 0.058 during explosions
+#          -> survived, 54 modes); with К1 the brake never went below 0.80
+#          -> died (1 mode). The ratchet is load-bearing; scar removal must
+#          not disable the brake. К1 stays available as an opt-in flag for
+#          A/B runs. Proper fix direction (К2/К3): fast brake + fast healing
+#          as SEPARATE mechanisms, designed on multi-seed data.
 # v10.9.1: Climate fix К1 (repair_plan addendum d): winsorize the E_slow
 #          INPUT at E_slow × climate_E_winsor_mult (default 3.0; ≤0 restores
 #          old behavior). E_fast/hold keep raw E. Observed on toy seed-42:
@@ -118,7 +126,7 @@ def _window_to_alpha(window: int) -> float:
 
 class GravBalancer:
     """
-    GravBalancer v10.9.1
+    GravBalancer v10.9.2
 
     Adaptive learning rate controller for N players.
     Manages dynamics based on observable stress proxies.
@@ -270,7 +278,7 @@ class GravBalancer:
         climate_slew_down: float = 0.05,         # lr_meta max decrease per step
         climate_slew_up: float = 0.01,           # lr_meta max increase per step
         climate_E_deadband: float = 0.02,        # E_slow must exceed 1+this before lr_meta responds
-        climate_E_winsor_mult: float = 3.0,      # (v10.9.1) clip E_slow INPUT to E_slow×this; ≤0 disables
+        climate_E_winsor_mult: float = 0.0,      # (v10.9.2) DEFAULT OFF: ≤0 = v10.9 behavior; >0 clips E_slow input (experimental К1)
         abs_lr_floor: Optional[float] = None,    # absolute LR floor after climate (None = base_lr*0.001)
 
         # --- Profile (§12) ---
