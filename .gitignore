@@ -5,6 +5,8 @@ data/
 results/
 results_gravbalancer/
 benchmark_output/
+benchmark_output*/
+examples/benchmark_output*/
 harness_report.html
 harness_report_*.html
 

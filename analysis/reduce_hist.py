@@ -26,7 +26,7 @@ import sys
 
 import numpy as np
 
-REDUCER_VERSION = "1.0"
+REDUCER_VERSION = "1.1"
 
 # Toy grid geometry (must match notebook config; validated against data
 # by _validate_grid on the first file that has final_fake).
@@ -130,8 +130,20 @@ def reduce_one(path, spe):
         out['ckpt_epochs'] = eps_
         out['ckpt_coverage'] = cov_          # protocol: 3000 pts, r=0.5, min5
         out['ckpt_off_manifold'] = off_
+    if 'probe_epochs' in d.files and d['probe_epochs'].size:
+        out['probe_epochs'] = d['probe_epochs'].tolist()
+        for k in d.files:
+            if k.startswith('probe_') and k != 'probe_epochs':
+                out[k] = np.asarray(d[k]).round(6).tolist()
     if 'final_fake' in d.files and d['final_fake'].size:
-        out['grid_median_dist'] = round(_validate_grid(d['final_fake']), 3)
+        ff = np.asarray(d['final_fake'])
+        out['grid_median_dist'] = round(_validate_grid(ff), 3)
+        if ff.shape[1] == 2:  # toy: финальное покрытие тем же протоколом (20k)
+            cov, off = coverage_stats(ff, mode_centers())
+            out['final_modes'] = cov
+            out['final_off_manifold'] = round(off, 4)
+    # ── collapse-события (критерий v2, toy-инстанс, утверждён 2026-06-10) ──
+    out.update(collapse_events(out))
     d.close()
     return out
 
@@ -163,6 +175,53 @@ def reduce_dir(out_dir, spe=976):
     return cache
 
 
+# ── Критерий коллапса v2 (утверждён владельцем 2026-06-10; toy-инстанс).
+# Процедура переносима, числа калиброваны на toy: подробности в
+# docs/repair_plan_v1_0.md (дополнение f). Для image-инстанса терминальная
+# метрика = D&C coverage, пороги калибруются по шуму CIFAR-прогона.
+CRIT = {'death_final_modes': 50, 'drop': 0.30, 'confirm_ckpts': 2,
+        'recovery': 0.7, 'spike_pad': (2.5, 5.0)}
+
+def collapse_events(r):
+    """По ckpt-покрытию + спайкам → события; death по финалу; TTC v2."""
+    cov, eps = r.get('ckpt_coverage'), r.get('ckpt_epochs')
+    segs = r.get('spike_segments', [])
+    out = {}
+    if not cov:
+        return out
+    ev, rm = [], 0
+    for i in range(len(cov)):
+        rm = max(rm, cov[i])
+        if rm < 10:
+            continue
+        thr = (1 - CRIT['drop']) * rm
+        conf = cov[i] <= thr and i + 1 < len(cov) and cov[i + 1] <= thr
+        near = any(a - CRIT['spike_pad'][0] <= eps[i] <= b + CRIT['spike_pad'][1]
+                   for a, b, _ in segs)
+        if conf and near:
+            rec = any(cov[j] >= CRIT['recovery'] * rm for j in range(i + 1, len(cov)))
+            ev.append({'ep': eps[i], 'recovered': bool(rec)})
+    out['collapse_events'] = ev
+    out['collapses_total'] = len(ev)
+    out['collapses_recovered'] = sum(1 for e in ev if e['recovered'])
+    fm = r.get('final_modes')
+    if fm is not None:
+        dead = fm < CRIT['death_final_modes']
+        out['verdict'] = 'DEAD' if dead else 'ALIVE'
+        if dead:
+            term = [e['ep'] for e in ev if not e['recovered']]
+            if term:
+                out['ttc_ep'] = term[0]
+            else:  # slow fade / край прогона: последняя «живая» эпоха
+                rm2, last_alive = 0, eps[-1]
+                for e_, v_ in zip(eps, cov):
+                    rm2 = max(rm2, v_)
+                    if v_ >= CRIT['recovery'] * rm2:
+                        last_alive = e_
+                out['ttc_ep'] = last_alive
+    return out
+
+
 # ────────────────────────────────────────────────────────── report
 
 MODES_ORDER = ['baseline', 'grav', 'div', 'grav_div']
@@ -186,7 +245,9 @@ def _lr_panel(cache, seed, lr_str):
     runs = {m: r for m, r in runs.items() if r and 'error' not in r}
     if not runs:
         return None
-    fig, axes = plt.subplots(4, 1, figsize=(11, 12), sharex=True)
+    has_probe = any('probe_epochs' in r for r in runs.values())
+    nrows = 5 if has_probe else 4
+    fig, axes = plt.subplots(nrows, 1, figsize=(11, 3 * nrows), sharex=True)
     fig.suptitle(f"seed {seed}  |  LR {lr_str}", fontsize=13)
 
     ax = axes[0]   # SURVIVAL: покрытие мод по чекпойнтам
@@ -231,8 +292,29 @@ def _lr_panel(cache, seed, lr_str):
             ax.plot(e[:len(lam)], np.clip(lam / max(lam.max(), 1e-9), 0, 1),
                     lw=0.8, ls='--', color=COLORS[m],
                     label=f"{m}: λ/{lam.max():.2f}")
-    ax.set_ylabel("control [0..1]"); ax.set_xlabel("epoch")
+    ax.set_ylabel("control [0..1]")
+    if not has_probe:
+        ax.set_xlabel("epoch")
     ax.set_ylim(-0.02, 1.05); ax.legend(fontsize=7, ncol=3); ax.grid(alpha=0.3)
+    if has_probe:
+        ax = axes[4]
+        for m, r in runs.items():
+            pe = r.get('probe_epochs')
+            if not pe:
+                continue
+            for pk, ls in [('probe_coverage', '-'), ('probe_kid', '--'),
+                           ('probe_swd', ':'), ('probe_density', '-.')]:
+                if pk in r:
+                    v = np.asarray(r[pk], dtype=float)
+                    vmax = np.nanmax(np.abs(v)) or 1.0
+                    lbl = pk.replace('probe_', '')
+                    if pk != 'probe_coverage':
+                        lbl += f'/{vmax:.3g}'
+                        v = v / vmax
+                    ax.plot(pe, v, ls, lw=1.0, color=COLORS[m],
+                            label=f"{m}:{lbl}")
+        ax.set_ylabel("probe (norm)"); ax.set_xlabel("epoch")
+        ax.legend(fontsize=6, ncol=4); ax.grid(alpha=0.3)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     return fig
 
@@ -257,8 +339,10 @@ def render_report(cache, out_path):
         f"<p>generated {time.strftime('%Y-%m-%d %H:%M')} | reducer v{REDUCER_VERSION} | "
         f"перезаписывается (история = git). Ckpt-покрытие: 3000 точек, r=0.5, "
         f"min5 — НЕ сравнивать с финальным 20k-протоколом.</p>",
-        "<h2>Сводка: события взрывов</h2><table><tr><th>run</th>"
-        "<th>spike segs</th><th>max amp</th><th>degraded</th><th>сегменты (ep)</th></tr>",
+        "<h2>Сводка: взрывы и коллапсы (критерий v2)</h2><table><tr><th>run</th>"
+        "<th>spike segs</th><th>max amp</th><th>degraded</th>"
+        "<th>коллапсы tot/rec</th><th>финал мод</th><th>вердикт/TTC</th>"
+        "<th>сегменты (ep)</th></tr>",
     ]
     for key in sorted(cache['runs']):
         r = cache['runs'][key]
@@ -268,8 +352,13 @@ def render_report(cache, out_path):
         segs = r['spike_segments']
         amp = max((s[2] for s in segs), default=0)
         seg_s = '; '.join(f"{a}–{b}" for a, b, _ in segs[:6]) + ('…' if len(segs) > 6 else '')
+        verdict = r.get('verdict', '·')
+        ttc = r.get('ttc_ep', '')
         parts.append(f"<tr><td>{key}</td><td>{len(segs)}</td><td>{amp:.1e}</td>"
-                     f"<td>{int(r.get('degraded', 0))}</td><td>{seg_s}</td></tr>")
+                     f"<td>{int(r.get('degraded', 0))}</td>"
+                     f"<td>{r.get('collapses_total','·')}/{r.get('collapses_recovered','·')}</td>"
+                     f"<td>{r.get('final_modes','·')}</td><td>{verdict} {ttc}</td>"
+                     f"<td>{seg_s}</td></tr>")
     parts.append("</table>")
     for seed in seeds:
         parts.append(f"<h2>{seed}</h2>")
