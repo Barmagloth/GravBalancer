@@ -117,7 +117,9 @@ def main(path):
         'smoke_toy':  dict(DATASET='toy_2d', EPOCHS=4, SEEDS=[42]),
         'smoke_cifar': dict(DATASET='cifar10', EPOCHS=2, SEEDS=[42]),
         'toy_full':   dict(DATASET='toy_2d', EPOCHS=80, SEEDS=[42, 43, 44]),
-        'cifar_full': dict(DATASET='cifar10', EPOCHS=300, SEEDS=[42]),
+        # SEEDS в cifar_full редактируются владельцем под конкретный прогон —
+        # проверяем форму (непустой список int), не значение
+        'cifar_full': dict(DATASET='cifar10', EPOCHS=300),
     }
     import re
     for p in PRESETS:
@@ -126,6 +128,9 @@ def main(path):
         for k, v in expect.get(p, {}).items():
             if g.get(k) != v:
                 fail(f"preset {p}: {k}={g.get(k)!r}, ожидалось {v!r}")
+        s = g.get('SEEDS')
+        if not (isinstance(s, list) and s and all(isinstance(x, int) for x in s)):
+            fail(f"preset {p}: SEEDS={s!r} — не непустой список int")
         assert g['IS_TOY'] == (g['DATASET'] == 'toy_2d')
         assert g['LR_G'] == g['LR_GRID'][0]
     print(f"OK 4: exec-симуляция {len(PRESETS)} пресетов")
